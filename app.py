@@ -2,50 +2,123 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 import io
+import yfinance as yf
+import plotly.express as px
 
 # ==========================================
 # PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="MTF Leverage & Sentiment Dashboard",
-    page_icon="📊",
+    page_title="Market Analytics Pro",
+    page_icon="📈",
     layout="wide"
 )
 
 # ==========================================
-# CORE ANALYTICS ENGINE
+# SECTOR MAPPING & CALENDAR HELPERS
 # ==========================================
+# A core mapping of major NSE stocks to identify Sectoral Cash Flows
+SECTOR_MAP = {
+    'HDFCBANK': 'Banking', 'ICICIBANK': 'Banking', 'SBIN': 'Banking', 'AXISBANK': 'Banking', 'KOTAKBANK': 'Banking',
+    'TCS': 'IT', 'INFY': 'IT', 'HCLTECH': 'IT', 'WIPRO': 'IT', 'TECHM': 'IT',
+    'RELIANCE': 'Energy', 'ONGC': 'Energy', 'NTPC': 'Energy', 'POWERGRID': 'Energy',
+    'TATAMOTORS': 'Auto', 'M&M': 'Auto', 'MARUTI': 'Auto', 'BAJAJ-AUTO': 'Auto', 'HEROMOTOCO': 'Auto',
+    'SUNPHARMA': 'Pharma', 'DRREDDY': 'Pharma', 'CIPLA': 'Pharma', 'DIVISLAB': 'Pharma',
+    'TATASTEEL': 'Metals', 'JSWSTEEL': 'Metals', 'HINDALCO': 'Metals', 'VEDL': 'Metals',
+    'ITC': 'FMCG', 'HUL': 'FMCG', 'NESTLEIND': 'FMCG', 'BRITANNIA': 'FMCG'
+}
+
+def get_sector(symbol):
+    return SECTOR_MAP.get(symbol.upper(), 'Other / Broader Market')
+
+def get_days_to_expiry(current_date):
+    """Calculates days remaining until the last Thursday of the current month."""
+    year = current_date.year
+    month = current_date.month
+    # Find the last day of the month
+    last_day = calendar.monthrange(year, month)[1]
+    # Find the last Thursday
+    last_thursday = date(year, month, last_day)
+    while last_thursday.weekday() != 3: # 3 is Thursday
+        last_thursday = last_thursday.replace(day=last_thursday.day - 1)
+    
+    dte = (last_thursday - current_date).days
+    
+    # If the last Thursday has already passed, calculate for next month
+    if dte < 0:
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+        last_day = calendar.monthrange(year, month)[1]
+        last_thursday = date(year, month, last_day)
+        while last_thursday.weekday() != 3:
+            last_thursday = last_thursday.replace(day=last_thursday.day - 1)
+        dte = (last_thursday - current_date).days
+        
+    return dte
+
+# ==========================================
+# ADVANCED RVOL (RELATIVE VOLUME) ENGINE
+# ==========================================
+@st.cache_data(ttl=3600) # Cache the YFinance download to avoid API limits
+def calculate_rvol(symbols):
+    """Fetches 15 days of history to calculate RVOL (Today's Vol / 10-Day Avg Vol)."""
+    if not symbols:
+        return pd.DataFrame(columns=['Symbol', 'RVOL'])
+    
+    try:
+        yf_symbols = " ".join([f"{s}.NS" for s in symbols])
+        hist = yf.download(yf_symbols, period="15d", progress=False)
+        
+        # yfinance returns different structures if 1 symbol vs multiple
+        vol_df = hist['Volume']
+        rvol_list = []
+        
+        if isinstance(vol_df, pd.DataFrame): # Multiple symbols
+            for col in vol_df.columns:
+                symbol = col.replace('.NS', '')
+                avg_vol = vol_df[col].iloc[:-1].mean() # Average of previous days
+                curr_vol = vol_df[col].iloc[-1]        # Most recent day
+                rvol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 0
+                rvol_list.append({'Symbol': symbol, 'RVOL': rvol})
+        else: # Single symbol
+            symbol = symbols[0]
+            avg_vol = vol_df.iloc[:-1].mean()
+            curr_vol = vol_df.iloc[-1]
+            rvol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 0
+            rvol_list.append({'Symbol': symbol, 'RVOL': rvol})
+            
+        return pd.DataFrame(rvol_list)
+    except Exception as e:
+        return pd.DataFrame(columns=['Symbol', 'RVOL'])
+
+# ==========================================
+# DATA STANDARDIZATION & CORE ENGINES
+# ==========================================
+def standardize_symbol(df):
+    for col in df.columns:
+        if col.strip().lower() in ['symbol', 'stock_symbol', 'scrip_name', 'symbol_name']:
+            df = df.rename(columns={col: 'Symbol'})
+            break
+    if 'Symbol' in df.columns:
+        df['Symbol'] = df['Symbol'].astype(str).str.strip().str.upper()
+    return df
+
 def process_mtf_data(df):
-    """
-    Processes raw or enriched MTF data, calculates daily changes, 
-    and classifies stocks into the 4 main MTF trend scenarios.
-    """
-    df_analyzed = df.copy()
+    df_analyzed = standardize_symbol(df.copy())
     
-    # Standardize column names (case-insensitive & whitespace cleanup)
-    df_analyzed.columns = [col.strip() for col in df_analyzed.columns]
-    
-    # 1. Delta MTF Calculation
+    # Calculate MTF Delta
     if 'Current_Day_Funded_Value' in df_analyzed.columns and 'Previous_Day_Funded_Value' in df_analyzed.columns:
         df_analyzed['Delta_MTF'] = df_analyzed['Current_Day_Funded_Value'] - df_analyzed['Previous_Day_Funded_Value']
-    elif 'Funded_Value' in df_analyzed.columns:
-        df_analyzed['Delta_MTF'] = df_analyzed['Funded_Value']
     else:
-        df_analyzed['Delta_MTF'] = 0
+        df_analyzed['Delta_MTF'] = df_analyzed.get('Funded_Value', 0)
 
-    # 2. Leverage Intensity Ratio
-    if 'Total_Daily_Delivery_Value' in df_analyzed.columns and 'Daily_Fresh_MTF_Capital_Added' in df_analyzed.columns:
-        df_analyzed['Leverage_Intensity_Ratio'] = np.where(
-            df_analyzed['Total_Daily_Delivery_Value'] > 0,
-            (df_analyzed['Daily_Fresh_MTF_Capital_Added'] / df_analyzed['Total_Daily_Delivery_Value']) * 100,
-            0
-        )
-    else:
-        df_analyzed['Leverage_Intensity_Ratio'] = 0.0
-
-    # 3. Categorize into 4 MTF Trend Matrix Scenarios
+    # Classify MTF Sentiments
     if 'Price_Change_Pct' in df_analyzed.columns:
         conditions = [
             (df_analyzed['Price_Change_Pct'] > 0) & (df_analyzed['Delta_MTF'] > 0),
@@ -53,187 +126,176 @@ def process_mtf_data(df):
             (df_analyzed['Price_Change_Pct'] < 0) & (df_analyzed['Delta_MTF'] > 0),
             (df_analyzed['Price_Change_Pct'] < 0) & (df_analyzed['Delta_MTF'] < 0)
         ]
-        choices = [
-            'Bullish Leverage Acceleration',
-            'Short-Covering / Profit Booking',
-            'Catching a Falling Knife (Danger)',
-            'Long Unwinding / Capitulation'
-        ]
-        df_analyzed['MTF_Scenario'] = np.select(conditions, choices, default='Neutral / Unchanged')
+        choices = ['Bullish Leverage Acceleration', 'Short-Covering / Profit Booking', 'Catching a Falling Knife (Danger)', 'Long Unwinding / Capitulation']
+        df_analyzed['MTF_Scenario'] = np.select(conditions, choices, default='Neutral')
     else:
-        df_analyzed['MTF_Scenario'] = 'Price Change Data Missing'
-
-    # 4. Critical Warning Flags
-    if 'Free_Float_Market_Cap' in df_analyzed.columns and 'Current_Day_Funded_Value' in df_analyzed.columns:
-        df_analyzed['Over_Leveraged_Warning'] = (df_analyzed['Current_Day_Funded_Value'] / df_analyzed['Free_Float_Market_Cap']) > 0.025
-    else:
-        df_analyzed['Over_Leveraged_Warning'] = False
-
+        df_analyzed['MTF_Scenario'] = 'No Price Data'
     return df_analyzed
 
+def process_fno_data(df):
+    df_analyzed = standardize_symbol(df.copy())
+    price_col = 'Price_Change_Pct' if 'Price_Change_Pct' in df_analyzed.columns else 'chng_in_price'
+    oi_col = 'Delta_OI' if 'Delta_OI' in df_analyzed.columns else 'chng_in_OI'
+    
+    if price_col not in df_analyzed.columns: df_analyzed[price_col] = 0.0
+    if oi_col not in df_analyzed.columns: df_analyzed[oi_col] = 0.0
 
-def fetch_nse_mtf_data(selected_date):
-    """
-    Attempts to download raw Margin Trading Disclosure CSV directly from NSE archives.
-    """
-    date_str = selected_date.strftime("%d%m%Y")
-    session = requests.Session()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
-        'Referer': 'https://www.nseindia.com/all-reports'
-    }
-    
-    target_url = f"https://nsearchives.nseindia.com/archives/equities/mtf/MTF_Disclosure_{date_str}.csv"
-    
-    try:
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        response = session.get(target_url, headers=headers, timeout=15)
-        
-        if response.status_code == 200:
-            # Read CSV content from response bytes
-            df = pd.read_csv(io.BytesIO(response.content))
-            return df, None
-        elif response.status_code == 404:
-            return None, "Error 404: NSE report for this date is not available yet."
-        elif response.status_code == 403:
-            return None, "Error 403: Access restricted by NSE firewall. Try uploading a CSV manually."
-        else:
-            return None, f"HTTP Error {response.status_code} while fetching from NSE."
-    except Exception as e:
-        return None, f"Network error: {str(e)}"
+    conditions = [
+        (df_analyzed[price_col] > 0) & (df_analyzed[oi_col] > 0),
+        (df_analyzed[price_col] > 0) & (df_analyzed[oi_col] < 0),
+        (df_analyzed[price_col] < 0) & (df_analyzed[oi_col] > 0),
+        (df_analyzed[price_col] < 0) & (df_analyzed[oi_col] < 0)
+    ]
+    choices = ['Long Buildup', 'Short Covering', 'Short Buildup', 'Long Unwinding']
+    df_analyzed['FnO_Scenario'] = np.select(conditions, choices, default='Neutral')
+    return df_analyzed, oi_col
 
-# ==========================================
-# USER INTERFACE (STREAMLIT)
-# ==========================================
+def process_price_action(df):
+    df_pa = standardize_symbol(df.copy())
+    req_cols = ['OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE']
+    for col in req_cols:
+        if col not in df_pa.columns: return df_pa, f"Missing {col}"
 
-st.title("📊 Daily Margin Trading Facility (MTF) Dashboard")
-st.markdown("Track leveraged retail conviction, detect sentiment shifts, and spot margin trap risks across Indian equities.")
-
-# --- SIDEBAR CONTROL PANEL ---
-st.sidebar.header("⚙️ Data Source Controls")
-
-data_source_mode = st.sidebar.radio(
-    "Select Data Input Method:",
-    ["Fetch Live from NSE", "Upload Custom CSV / ScanX File"]
-)
-
-raw_df = None
-
-if data_source_mode == "Fetch Live from NSE":
-    selected_date = st.sidebar.date_input("Select Report Date", datetime.now())
-    generate_btn = st.sidebar.button("🚀 Fetch & Generate Dashboard", type="primary")
-    
-    if generate_btn:
-        with st.spinner("Connecting to NSE archives and fetching MTF disclosure..."):
-            df_fetched, err_msg = fetch_nse_mtf_data(selected_date)
-            if df_fetched is not None:
-                st.session_state['data'] = df_fetched
-                st.sidebar.success(f"Successfully loaded data for {selected_date.strftime('%d-%b-%Y')}!")
-            else:
-                st.sidebar.error(err_msg)
-
-else:
-    uploaded_file = st.sidebar.file_uploader("Upload MTF CSV File", type=["csv"])
-    if uploaded_file is not None:
-        try:
-            raw_df = pd.read_csv(uploaded_file)
-            st.session_state['data'] = raw_df
-            st.sidebar.success("CSV file uploaded successfully!")
-        except Exception as e:
-            st.sidebar.error(f"Error reading CSV: {e}")
-
-# --- MAIN DASHBOARD BODY ---
-if 'data' in st.session_state and st.session_state['data'] is not None:
-    # Process the loaded data
-    processed_df = process_mtf_data(st.session_state['data'])
-    
-    st.divider()
-    
-    # 1. SUMMARY METRICS ROW
-    total_stocks = len(processed_df)
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    bullish_cnt = len(processed_df[processed_df['MTF_Scenario'] == 'Bullish Leverage Acceleration'])
-    short_cov_cnt = len(processed_df[processed_df['MTF_Scenario'] == 'Short-Covering / Profit Booking'])
-    falling_knife_cnt = len(processed_df[processed_df['MTF_Scenario'] == 'Catching a Falling Knife (Danger)'])
-    unwinding_cnt = len(processed_df[processed_df['MTF_Scenario'] == 'Long Unwinding / Capitulation'])
-    
-    col1.metric("Total Stocks", f"{total_stocks:,}")
-    col2.metric("🟢 Bullish Acceleration", f"{bullish_cnt}")
-    col3.metric("🔵 Short-Covering", f"{short_cov_cnt}")
-    col4.metric("🔴 Falling Knives (Risk)", f"{falling_knife_cnt}")
-    col5.metric("🟡 Long Unwinding", f"{unwinding_cnt}")
-    
-    st.divider()
-    
-    # 2. TOP 10 STOCKS PER CATEGORY
-    st.subheader("📌 Top 10 Stocks by Sentiment Category")
-    
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🟢 Bullish Leverage Acceleration", 
-        "🔵 Short-Covering / Profit Booking", 
-        "🔴 Catching a Falling Knife", 
-        "🟡 Long Unwinding"
-    ])
-    
-    # Sort helper to get top 10 by leverage velocity/change
-    sort_column = 'Delta_MTF' if 'Delta_MTF' in processed_df.columns else processed_df.columns[0]
-    
-    with tab1:
-        st.markdown("**Price Up + MTF Up:** Strong upward momentum backed by aggressive leveraged buying.")
-        cat1_df = processed_df[processed_df['MTF_Scenario'] == 'Bullish Leverage Acceleration']
-        top10_cat1 = cat1_df.sort_values(by=sort_column, ascending=False).head(10)
-        st.dataframe(top10_cat1, use_container_width=True)
-        
-    with tab2:
-        st.markdown("**Price Up + MTF Down:** Price rising while leveraged traders exit. Loss of institutional/leveraged support.")
-        cat2_df = processed_df[processed_df['MTF_Scenario'] == 'Short-Covering / Profit Booking']
-        top10_cat2 = cat2_df.sort_values(by=sort_column, ascending=True).head(10)
-        st.dataframe(top10_cat2, use_container_width=True)
-
-    with tab3:
-        st.markdown("**Price Down + MTF Up:** High risk! Retail is adding margin to falling positions. Liquidation trap.")
-        cat3_df = processed_df[processed_df['MTF_Scenario'] == 'Catching a Falling Knife (Danger)']
-        top10_cat3 = cat3_df.sort_values(by=sort_column, ascending=False).head(10)
-        st.dataframe(top10_cat3, use_container_width=True)
-
-    with tab4:
-        st.markdown("**Price Down + MTF Down:** Weak hands being forced out. Healthy correction or potential structural bottom.")
-        cat4_df = processed_df[processed_df['MTF_Scenario'] == 'Long Unwinding / Capitulation']
-        top10_cat4 = cat4_df.sort_values(by=sort_column, ascending=True).head(10)
-        st.dataframe(top10_cat4, use_container_width=True)
-
-    st.divider()
-    
-    # 3. COMPLETE DATASET VIEW & DOWNLOAD
-    st.subheader("📋 Full Analyzed Dataset")
-    
-    search_query = st.text_input("🔍 Search by Stock Symbol", "")
-    
-    if search_query:
-        # Simple symbol filter if symbol column exists
-        symbol_col = [col for col in processed_df.columns if 'symbol' in col.lower() or 'scrip' in col.lower() or 'name' in col.lower()]
-        if symbol_col:
-            display_df = processed_df[processed_df[symbol_col[0]].astype(str).str.contains(search_query.upper(), na=False)]
-        else:
-            display_df = processed_df
+    # Extract Delivery
+    deliv_col = next((c for c in df_pa.columns if 'DELIV' in c and 'PER' in c), None)
+    if deliv_col:
+        df_pa['Delivery_%'] = pd.to_numeric(df_pa[deliv_col].astype(str).str.replace('-', '0'), errors='coerce').fillna(0)
     else:
-        display_df = processed_df
-        
-    st.dataframe(display_df, use_container_width=True, height=400)
-    
-    # Convert dataframe to CSV for download
-    csv_data = display_df.to_csv(index=False).encode('utf-8')
-    
-    st.download_button(
-        label="📥 Download Analyzed CSV Report",
-        data=csv_data,
-        file_filename=f"MTF_Analyzed_Report_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-        type="primary"
-    )
+        df_pa['Delivery_%'] = 0.0
 
+    df_pa = df_pa[df_pa['CLOSE_PRICE'] > 10]
+    O, H, L, C = df_pa['OPEN_PRICE'], df_pa['HIGH_PRICE'], df_pa['LOW_PRICE'], df_pa['CLOSE_PRICE']
+    
+    candle_range = np.where((H - L) == 0, 0.0001, H - L)
+    df_pa['Gain_Holding_Score_%'] = (((C - L) / candle_range) * 100).round(2)
+    
+    return df_pa, None
+
+def calculate_master_confluence(mtf_df, fno_df, pa_df):
+    mtf_processed = process_mtf_data(mtf_df)
+    fno_processed, oi_col = process_fno_data(fno_df)
+    pa_processed, pa_err = process_price_action(pa_df)
+    
+    if pa_err: return None, pa_err
+
+    # 1. Merge the 3 datasets
+    merged = pd.merge(mtf_processed[['Symbol', 'MTF_Scenario', 'Delta_MTF']], fno_processed[['Symbol', 'FnO_Scenario', oi_col]], on='Symbol', how='inner')
+    merged = pd.merge(merged, pa_processed[['Symbol', 'CLOSE_PRICE', 'Gain_Holding_Score_%', 'Delivery_%']], on='Symbol', how='inner')
+    
+    # 2. Add Sector
+    merged['Sector'] = merged['Symbol'].apply(get_sector)
+    
+    # 3. Add RVOL (Relative Volume) via YFinance API
+    rvol_df = calculate_rvol(merged['Symbol'].tolist())
+    if not rvol_df.empty:
+        merged = pd.merge(merged, rvol_df, on='Symbol', how='left').fillna(1.0)
+    else:
+        merged['RVOL'] = 1.0
+
+    # 4. Master Confluence Logic
+    is_bullish = (merged['MTF_Scenario'] == 'Bullish Leverage Acceleration') & (merged['FnO_Scenario'] == 'Long Buildup') & (merged['Gain_Holding_Score_%'] >= 80)
+    is_bearish = (merged['FnO_Scenario'] == 'Short Buildup') & ((merged['Gain_Holding_Score_%'] <= 20) | (merged['MTF_Scenario'] == 'Catching a Falling Knife (Danger)'))
+    
+    conditions = [
+        (is_bullish) & (merged['Delivery_%'] >= 50.0) & (merged['RVOL'] >= 1.5), # Supreme Conviction
+        (is_bullish) & (merged['Delivery_%'] >= 50.0), # Standard Institutional
+        (is_bullish) & (merged['Delivery_%'] < 50.0),  # Speculative
+        (is_bearish)
+    ]
+    choices = [
+        '🌟 SUPREME BULL (Inst. Buy + Volume Spike)',
+        '🏛️ INSTITUTIONAL BULL (>50% Delivery)',
+        '🎲 SPECULATIVE BULL (<50% Delivery)',
+        '🚨 BEARISH CONVICTION (HIGH RISK)'
+    ]
+    merged['Master_Signal'] = np.select(conditions, choices, default='Neutral / Mixed')
+    
+    return merged, None
+
+# ==========================================
+# USER INTERFACE
+# ==========================================
+st.sidebar.title("🧭 The Quant Engine")
+st.title("⚡ Master Confluence Engine 2.0")
+st.markdown("Fusing Cash Leverage, Derivative OI, Price Action, RVOL, and Sectoral flows.")
+
+# Check Expiry Context
+today = date.today()
+dte = get_days_to_expiry(today)
+if dte <= 4:
+    st.warning(f"⚠️ **Expiry Week Alert:** Only {dte} days to F&O Expiry. Take 'Long Unwinding' and 'Short Covering' signals with caution, as institutions are likely just rolling over contracts rather than reversing trends.")
+
+st.sidebar.header("📁 Upload EOD Data")
+mtf_file = st.sidebar.file_uploader("1. MTF Disclosure", type=["csv"])
+fno_file = st.sidebar.file_uploader("2. F&O Participant OI", type=["csv"])
+pa_file = st.sidebar.file_uploader("3. EOD Bhavcopy", type=["csv"])
+
+if mtf_file and fno_file and pa_file:
+    try:
+        mtf_raw, fno_raw, pa_raw = pd.read_csv(mtf_file), pd.read_csv(fno_file), pd.read_csv(pa_file)
+        
+        with st.spinner("Crunching data, fetching RVOL from Yahoo Finance, and mapping sectors..."):
+            confluence_df, error = calculate_master_confluence(mtf_raw, fno_raw, pa_raw)
+        
+        if error:
+            st.error(error)
+        else:
+            supreme = confluence_df[confluence_df['Master_Signal'] == '🌟 SUPREME BULL (Inst. Buy + Volume Spike)']
+            inst = confluence_df[confluence_df['Master_Signal'] == '🏛️ INSTITUTIONAL BULL (>50% Delivery)']
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("🌟 Supreme Conviction Trades", len(supreme))
+            c2.metric("🏛️ Standard Institutional Buys", len(inst))
+            c3.metric("🚨 High Risk Shorts", len(confluence_df[confluence_df['Master_Signal'] == '🚨 BEARISH CONVICTION (HIGH RISK)']))
+            
+            st.divider()
+            
+            # DASHBOARD TABS
+            t1, t2, t3, t4 = st.tabs(["🎯 Top Signals", "📊 Visual Screener (Chart)", "🗺️ Sector Heatmap", "📋 Database"])
+            
+            with t1:
+                st.subheader("High Conviction Breakouts")
+                display_cols = ['Symbol', 'Sector', 'CLOSE_PRICE', 'Delivery_%', 'Gain_Holding_Score_%', 'RVOL', 'Master_Signal']
+                combined_bulls = pd.concat([supreme, inst]).sort_values(by=['RVOL', 'Delivery_%'], ascending=[False, False])
+                st.dataframe(combined_bulls[display_cols], use_container_width=True)
+                
+            with t2:
+                st.subheader("Institutional Quadrant Analysis")
+                st.markdown("Look for dots in the **Top-Right** (High Delivery + Held Intraday Gains). Size of dot = RVOL.")
+                
+                # Plotly Interactive Scatter Chart
+                fig = px.scatter(
+                    confluence_df[confluence_df['Master_Signal'] != 'Neutral / Mixed'],
+                    x="Delivery_%", y="Gain_Holding_Score_%",
+                    color="Master_Signal", size="RVOL", hover_name="Symbol",
+                    hover_data=["Sector", "CLOSE_PRICE"],
+                    color_discrete_map={
+                        '🌟 SUPREME BULL (Inst. Buy + Volume Spike)': '#00FF00',
+                        '🏛️ INSTITUTIONAL BULL (>50% Delivery)': '#008000',
+                        '🎲 SPECULATIVE BULL (<50% Delivery)': '#FFA500',
+                        '🚨 BEARISH CONVICTION (HIGH RISK)': '#FF0000'
+                    },
+                    template="plotly_dark", height=600
+                )
+                fig.add_hline(y=80, line_dash="dash", line_color="gray", annotation_text="Strong Close Line")
+                fig.add_vline(x=50, line_dash="dash", line_color="gray", annotation_text="Inst. Delivery Line")
+                st.plotly_chart(fig, use_container_width=True)
+
+            with t3:
+                st.subheader("Sectoral Heatmap (Where is the money flowing?)")
+                # Group by Sector to see which sectors have the most Bullish signals today
+                bulls_only = confluence_df[confluence_df['Master_Signal'].str.contains('BULL')]
+                if not bulls_only.empty:
+                    sector_flow = bulls_only.groupby('Sector').size().reset_index(name='Bullish_Signals').sort_values(by='Bullish_Signals', ascending=False)
+                    st.bar_chart(sector_flow.set_index('Sector'))
+                else:
+                    st.info("No clear sector trends today.")
+
+            with t4:
+                st.dataframe(confluence_df, use_container_width=True)
+                st.download_button("📥 Download Database", confluence_df.to_csv(index=False).encode('utf-8'), "Quant_Master_Report.csv", "text/csv")
+                
+    except Exception as e:
+        st.error(f"Execution Error: {e}")
 else:
-    st.info("👈 Use the sidebar on the left to select a date and click **Fetch & Generate Dashboard** or upload a custom CSV file to view the analysis.")
+    st.info("Upload MTF, F&O, and Bhavcopy CSVs to initiate the Quant Engine.")
