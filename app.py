@@ -20,7 +20,6 @@ st.set_page_config(
 # ==========================================
 # SECTOR MAPPING & CALENDAR HELPERS
 # ==========================================
-# A core mapping of major NSE stocks to identify Sectoral Cash Flows
 SECTOR_MAP = {
     'HDFCBANK': 'Banking', 'ICICIBANK': 'Banking', 'SBIN': 'Banking', 'AXISBANK': 'Banking', 'KOTAKBANK': 'Banking',
     'TCS': 'IT', 'INFY': 'IT', 'HCLTECH': 'IT', 'WIPRO': 'IT', 'TECHM': 'IT',
@@ -35,25 +34,17 @@ def get_sector(symbol):
     return SECTOR_MAP.get(symbol.upper(), 'Other / Broader Market')
 
 def get_days_to_expiry(current_date):
-    """Calculates days remaining until the last Thursday of the current month."""
-    year = current_date.year
-    month = current_date.month
-    # Find the last day of the month
+    year, month = current_date.year, current_date.month
     last_day = calendar.monthrange(year, month)[1]
-    # Find the last Thursday
     last_thursday = date(year, month, last_day)
-    while last_thursday.weekday() != 3: # 3 is Thursday
+    while last_thursday.weekday() != 3: 
         last_thursday = last_thursday.replace(day=last_thursday.day - 1)
     
     dte = (last_thursday - current_date).days
     
-    # If the last Thursday has already passed, calculate for next month
     if dte < 0:
-        if month == 12:
-            year += 1
-            month = 1
-        else:
-            month += 1
+        month = 1 if month == 12 else month + 1
+        year = year + 1 if month == 1 else year
         last_day = calendar.monthrange(year, month)[1]
         last_thursday = date(year, month, last_day)
         while last_thursday.weekday() != 3:
@@ -63,62 +54,85 @@ def get_days_to_expiry(current_date):
     return dte
 
 # ==========================================
-# ADVANCED RVOL (RELATIVE VOLUME) ENGINE
+# DATA FETCHERS (AUTO-DOWNLOAD)
 # ==========================================
-@st.cache_data(ttl=3600) # Cache the YFinance download to avoid API limits
-def calculate_rvol(symbols):
-    """Fetches 15 days of history to calculate RVOL (Today's Vol / 10-Day Avg Vol)."""
-    if not symbols:
-        return pd.DataFrame(columns=['Symbol', 'RVOL'])
+def fetch_nse_data(selected_date, report_type="MTF"):
+    date_str = selected_date.strftime("%d%m%Y")
+    session = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Referer': 'https://www.nseindia.com/all-reports'
+    }
     
+    if report_type == "MTF":
+        target_url = f"https://nsearchives.nseindia.com/archives/equities/mtf/MTF_Disclosure_{date_str}.csv"
+    elif report_type == "FNO":
+        target_url = f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{date_str}.csv"
+    else: # BHAVCOPY
+        target_url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
+        
+    try:
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        response = session.get(target_url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            return pd.read_csv(io.BytesIO(response.content)), None
+        elif response.status_code == 404:
+            return None, f"404: {report_type} report not uploaded by NSE yet."
+        elif response.status_code == 403:
+            return None, f"403: NSE blocked the download for {report_type}. Use manual upload."
+        else:
+            return None, f"Error {response.status_code} fetching {report_type}."
+    except Exception as e:
+        return None, f"Network error fetching {report_type}: {str(e)}"
+
+# ==========================================
+# ADVANCED RVOL ENGINE
+# ==========================================
+@st.cache_data(ttl=3600)
+def calculate_rvol(symbols):
+    if not symbols: return pd.DataFrame(columns=['Symbol', 'RVOL'])
     try:
         yf_symbols = " ".join([f"{s}.NS" for s in symbols])
         hist = yf.download(yf_symbols, period="15d", progress=False)
-        
-        # yfinance returns different structures if 1 symbol vs multiple
         vol_df = hist['Volume']
         rvol_list = []
         
-        if isinstance(vol_df, pd.DataFrame): # Multiple symbols
+        if isinstance(vol_df, pd.DataFrame):
             for col in vol_df.columns:
                 symbol = col.replace('.NS', '')
-                avg_vol = vol_df[col].iloc[:-1].mean() # Average of previous days
-                curr_vol = vol_df[col].iloc[-1]        # Most recent day
-                rvol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 0
-                rvol_list.append({'Symbol': symbol, 'RVOL': rvol})
-        else: # Single symbol
+                avg_vol = vol_df[col].iloc[:-1].mean()
+                curr_vol = vol_df[col].iloc[-1]
+                rvol_list.append({'Symbol': symbol, 'RVOL': round(curr_vol / avg_vol, 2) if avg_vol > 0 else 0})
+        else:
             symbol = symbols[0]
             avg_vol = vol_df.iloc[:-1].mean()
             curr_vol = vol_df.iloc[-1]
-            rvol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 0
-            rvol_list.append({'Symbol': symbol, 'RVOL': rvol})
+            rvol_list.append({'Symbol': symbol, 'RVOL': round(curr_vol / avg_vol, 2) if avg_vol > 0 else 0})
             
         return pd.DataFrame(rvol_list)
-    except Exception as e:
+    except:
         return pd.DataFrame(columns=['Symbol', 'RVOL'])
 
 # ==========================================
-# DATA STANDARDIZATION & CORE ENGINES
+# CORE ENGINES
 # ==========================================
 def standardize_symbol(df):
     for col in df.columns:
         if col.strip().lower() in ['symbol', 'stock_symbol', 'scrip_name', 'symbol_name']:
             df = df.rename(columns={col: 'Symbol'})
             break
-    if 'Symbol' in df.columns:
-        df['Symbol'] = df['Symbol'].astype(str).str.strip().str.upper()
+    if 'Symbol' in df.columns: df['Symbol'] = df['Symbol'].astype(str).str.strip().str.upper()
     return df
 
 def process_mtf_data(df):
     df_analyzed = standardize_symbol(df.copy())
-    
-    # Calculate MTF Delta
     if 'Current_Day_Funded_Value' in df_analyzed.columns and 'Previous_Day_Funded_Value' in df_analyzed.columns:
         df_analyzed['Delta_MTF'] = df_analyzed['Current_Day_Funded_Value'] - df_analyzed['Previous_Day_Funded_Value']
     else:
         df_analyzed['Delta_MTF'] = df_analyzed.get('Funded_Value', 0)
 
-    # Classify MTF Sentiments
     if 'Price_Change_Pct' in df_analyzed.columns:
         conditions = [
             (df_analyzed['Price_Change_Pct'] > 0) & (df_analyzed['Delta_MTF'] > 0),
@@ -156,7 +170,6 @@ def process_price_action(df):
     for col in req_cols:
         if col not in df_pa.columns: return df_pa, f"Missing {col}"
 
-    # Extract Delivery
     deliv_col = next((c for c in df_pa.columns if 'DELIV' in c and 'PER' in c), None)
     if deliv_col:
         df_pa['Delivery_%'] = pd.to_numeric(df_pa[deliv_col].astype(str).str.replace('-', '0'), errors='coerce').fillna(0)
@@ -168,7 +181,6 @@ def process_price_action(df):
     
     candle_range = np.where((H - L) == 0, 0.0001, H - L)
     df_pa['Gain_Holding_Score_%'] = (((C - L) / candle_range) * 100).round(2)
-    
     return df_pa, None
 
 def calculate_master_confluence(mtf_df, fno_df, pa_df):
@@ -178,36 +190,26 @@ def calculate_master_confluence(mtf_df, fno_df, pa_df):
     
     if pa_err: return None, pa_err
 
-    # 1. Merge the 3 datasets
     merged = pd.merge(mtf_processed[['Symbol', 'MTF_Scenario', 'Delta_MTF']], fno_processed[['Symbol', 'FnO_Scenario', oi_col]], on='Symbol', how='inner')
     merged = pd.merge(merged, pa_processed[['Symbol', 'CLOSE_PRICE', 'Gain_Holding_Score_%', 'Delivery_%']], on='Symbol', how='inner')
-    
-    # 2. Add Sector
     merged['Sector'] = merged['Symbol'].apply(get_sector)
     
-    # 3. Add RVOL (Relative Volume) via YFinance API
     rvol_df = calculate_rvol(merged['Symbol'].tolist())
     if not rvol_df.empty:
         merged = pd.merge(merged, rvol_df, on='Symbol', how='left').fillna(1.0)
     else:
         merged['RVOL'] = 1.0
 
-    # 4. Master Confluence Logic
     is_bullish = (merged['MTF_Scenario'] == 'Bullish Leverage Acceleration') & (merged['FnO_Scenario'] == 'Long Buildup') & (merged['Gain_Holding_Score_%'] >= 80)
     is_bearish = (merged['FnO_Scenario'] == 'Short Buildup') & ((merged['Gain_Holding_Score_%'] <= 20) | (merged['MTF_Scenario'] == 'Catching a Falling Knife (Danger)'))
     
     conditions = [
-        (is_bullish) & (merged['Delivery_%'] >= 50.0) & (merged['RVOL'] >= 1.5), # Supreme Conviction
-        (is_bullish) & (merged['Delivery_%'] >= 50.0), # Standard Institutional
-        (is_bullish) & (merged['Delivery_%'] < 50.0),  # Speculative
+        (is_bullish) & (merged['Delivery_%'] >= 50.0) & (merged['RVOL'] >= 1.5),
+        (is_bullish) & (merged['Delivery_%'] >= 50.0),
+        (is_bullish) & (merged['Delivery_%'] < 50.0),
         (is_bearish)
     ]
-    choices = [
-        '🌟 SUPREME BULL (Inst. Buy + Volume Spike)',
-        '🏛️ INSTITUTIONAL BULL (>50% Delivery)',
-        '🎲 SPECULATIVE BULL (<50% Delivery)',
-        '🚨 BEARISH CONVICTION (HIGH RISK)'
-    ]
+    choices = ['🌟 SUPREME BULL (Inst. Buy + Volume Spike)', '🏛️ INSTITUTIONAL BULL (>50% Delivery)', '🎲 SPECULATIVE BULL (<50% Delivery)', '🚨 BEARISH CONVICTION (HIGH RISK)']
     merged['Master_Signal'] = np.select(conditions, choices, default='Neutral / Mixed')
     
     return merged, None
@@ -217,23 +219,51 @@ def calculate_master_confluence(mtf_df, fno_df, pa_df):
 # ==========================================
 st.sidebar.title("🧭 The Quant Engine")
 st.title("⚡ Master Confluence Engine 2.0")
-st.markdown("Fusing Cash Leverage, Derivative OI, Price Action, RVOL, and Sectoral flows.")
 
-# Check Expiry Context
-today = date.today()
-dte = get_days_to_expiry(today)
+dte = get_days_to_expiry(date.today())
 if dte <= 4:
-    st.warning(f"⚠️ **Expiry Week Alert:** Only {dte} days to F&O Expiry. Take 'Long Unwinding' and 'Short Covering' signals with caution, as institutions are likely just rolling over contracts rather than reversing trends.")
+    st.warning(f"⚠️ **Expiry Week Alert:** Only {dte} days to F&O Expiry. Take 'Long Unwinding' and 'Short Covering' signals with caution.")
 
-st.sidebar.header("📁 Upload EOD Data")
-mtf_file = st.sidebar.file_uploader("1. MTF Disclosure", type=["csv"])
-fno_file = st.sidebar.file_uploader("2. F&O Participant OI", type=["csv"])
-pa_file = st.sidebar.file_uploader("3. EOD Bhavcopy", type=["csv"])
+# THE NEW DATA INGESTION MENU
+st.sidebar.header("📥 Data Input Method")
+input_mode = st.sidebar.radio("Choose how to load data:", ["Auto-Fetch from NSE", "Manual Upload Backup"])
 
-if mtf_file and fno_file and pa_file:
+mtf_raw, fno_raw, pa_raw = None, None, None
+data_ready = False
+
+if input_mode == "Auto-Fetch from NSE":
+    st.sidebar.markdown("Attempts to download files directly. *(Note: NSE sometimes blocks cloud servers).*")
+    selected_date = st.sidebar.date_input("Select Trading Date", datetime.now())
+    
+    if st.sidebar.button("🚀 Fetch & Analyze", type="primary"):
+        with st.spinner("Knocking on NSE's servers..."):
+            mtf_raw, m_err = fetch_nse_data(selected_date, "MTF")
+            fno_raw, f_err = fetch_nse_data(selected_date, "FNO")
+            pa_raw, p_err = fetch_nse_data(selected_date, "BHAVCOPY")
+            
+            # Error checking
+            if m_err or f_err or p_err:
+                if m_err: st.sidebar.error(m_err)
+                if f_err: st.sidebar.error(f_err)
+                if p_err: st.sidebar.error(p_err)
+            else:
+                data_ready = True
+
+elif input_mode == "Manual Upload Backup":
+    st.sidebar.markdown("Use this if the Auto-Fetch fails due to NSE blocks.")
+    mtf_file = st.sidebar.file_uploader("1. MTF Disclosure", type=["csv"])
+    fno_file = st.sidebar.file_uploader("2. F&O Participant OI", type=["csv"])
+    pa_file = st.sidebar.file_uploader("3. EOD Bhavcopy", type=["csv"])
+    
+    if mtf_file and fno_file and pa_file:
+        mtf_raw = pd.read_csv(mtf_file)
+        fno_raw = pd.read_csv(fno_file)
+        pa_raw = pd.read_csv(pa_file)
+        data_ready = True
+
+# PROCESS DATA IF READY
+if data_ready:
     try:
-        mtf_raw, fno_raw, pa_raw = pd.read_csv(mtf_file), pd.read_csv(fno_file), pd.read_csv(pa_file)
-        
         with st.spinner("Crunching data, fetching RVOL from Yahoo Finance, and mapping sectors..."):
             confluence_df, error = calculate_master_confluence(mtf_raw, fno_raw, pa_raw)
         
@@ -249,8 +279,6 @@ if mtf_file and fno_file and pa_file:
             c3.metric("🚨 High Risk Shorts", len(confluence_df[confluence_df['Master_Signal'] == '🚨 BEARISH CONVICTION (HIGH RISK)']))
             
             st.divider()
-            
-            # DASHBOARD TABS
             t1, t2, t3, t4 = st.tabs(["🎯 Top Signals", "📊 Visual Screener (Chart)", "🗺️ Sector Heatmap", "📋 Database"])
             
             with t1:
@@ -263,7 +291,6 @@ if mtf_file and fno_file and pa_file:
                 st.subheader("Institutional Quadrant Analysis")
                 st.markdown("Look for dots in the **Top-Right** (High Delivery + Held Intraday Gains). Size of dot = RVOL.")
                 
-                # Plotly Interactive Scatter Chart
                 fig = px.scatter(
                     confluence_df[confluence_df['Master_Signal'] != 'Neutral / Mixed'],
                     x="Delivery_%", y="Gain_Holding_Score_%",
@@ -277,13 +304,12 @@ if mtf_file and fno_file and pa_file:
                     },
                     template="plotly_dark", height=600
                 )
-                fig.add_hline(y=80, line_dash="dash", line_color="gray", annotation_text="Strong Close Line")
-                fig.add_vline(x=50, line_dash="dash", line_color="gray", annotation_text="Inst. Delivery Line")
+                fig.add_hline(y=80, line_dash="dash", line_color="gray", annotation_text="Strong Close")
+                fig.add_vline(x=50, line_dash="dash", line_color="gray", annotation_text="Inst. Delivery")
                 st.plotly_chart(fig, use_container_width=True)
 
             with t3:
                 st.subheader("Sectoral Heatmap (Where is the money flowing?)")
-                # Group by Sector to see which sectors have the most Bullish signals today
                 bulls_only = confluence_df[confluence_df['Master_Signal'].str.contains('BULL')]
                 if not bulls_only.empty:
                     sector_flow = bulls_only.groupby('Sector').size().reset_index(name='Bullish_Signals').sort_values(by='Bullish_Signals', ascending=False)
@@ -297,5 +323,7 @@ if mtf_file and fno_file and pa_file:
                 
     except Exception as e:
         st.error(f"Execution Error: {e}")
-else:
+elif not data_ready and input_mode == "Manual Upload Backup":
     st.info("Upload MTF, F&O, and Bhavcopy CSVs to initiate the Quant Engine.")
+else:
+    st.info("Select a date and click 'Fetch & Analyze' to run the engine.")
