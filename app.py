@@ -54,6 +54,32 @@ def get_days_to_expiry(current_date):
     return dte
 
 # ==========================================
+# ROBUST CSV LOADER (ENCODING & CLEANING)
+# ==========================================
+def load_and_clean_csv(file_obj):
+    """
+    Safely reads CSVs across different encodings and strips hidden whitespace.
+    Works for both downloaded BytesIO (Requests) and UploadedFiles (Streamlit).
+    """
+    if file_obj is None:
+        return None
+        
+    if isinstance(file_obj, bytes):
+        file_obj = io.BytesIO(file_obj)
+
+    for encoding in ['utf-8', 'latin1', 'cp1252']:
+        try:
+            if hasattr(file_obj, 'seek'):
+                file_obj.seek(0)
+            df = pd.read_csv(file_obj, encoding=encoding)
+            # Strip hidden whitespace from headers
+            df.columns = df.columns.astype(str).str.strip()
+            return df
+        except Exception:
+            continue
+    return None
+
+# ==========================================
 # DATA FETCHERS (AUTO-DOWNLOAD)
 # ==========================================
 def fetch_nse_data(selected_date, report_type="MTF"):
@@ -77,7 +103,7 @@ def fetch_nse_data(selected_date, report_type="MTF"):
         response = session.get(target_url, headers=headers, timeout=15)
         
         if response.status_code == 200:
-            return pd.read_csv(io.BytesIO(response.content)), None
+            return load_and_clean_csv(response.content), None
         elif response.status_code == 404:
             return None, f"404: {report_type} report not uploaded by NSE yet."
         elif response.status_code == 403:
@@ -184,35 +210,116 @@ def process_price_action(df):
     return df_pa, None
 
 def calculate_master_confluence(mtf_df, fno_df, pa_df):
-    mtf_processed = process_mtf_data(mtf_df)
-    fno_processed, oi_col = process_fno_data(fno_df)
-    pa_processed, pa_err = process_price_action(pa_df)
+    active_sources = []
+    missing_sources = []
     
-    if pa_err: return None, pa_err
+    pa_processed, mtf_processed, fno_processed = None, None, None
+    pa_err = None
 
-    merged = pd.merge(mtf_processed[['Symbol', 'MTF_Scenario', 'Delta_MTF']], fno_processed[['Symbol', 'FnO_Scenario', oi_col]], on='Symbol', how='inner')
-    merged = pd.merge(merged, pa_processed[['Symbol', 'CLOSE_PRICE', 'Gain_Holding_Score_%', 'Delivery_%']], on='Symbol', how='inner')
+    # Track available vs missing datasets
+    if pa_df is not None:
+        pa_processed, pa_err = process_price_action(pa_df)
+        if not pa_err: active_sources.append("Price Action & Delivery (Bhavcopy)")
+        else: missing_sources.append(f"Bhavcopy Error: {pa_err}")
+    else:
+        missing_sources.append("Price Action & Delivery (Bhavcopy)")
+
+    if mtf_df is not None:
+        mtf_processed = process_mtf_data(mtf_df)
+        active_sources.append("MTF Retail Leverage")
+    else:
+        missing_sources.append("MTF Retail Leverage")
+
+    if fno_df is not None:
+        fno_processed, oi_col = process_fno_data(fno_df)
+        active_sources.append("F&O Smart Money OI")
+    else:
+        missing_sources.append("F&O Smart Money OI")
+
+    if not active_sources:
+        return None, "No valid datasets available to process.", [], []
+
+    # Initialize Base Dataframe Dynamically
+    if pa_processed is not None:
+        merged = pa_processed[['Symbol', 'CLOSE_PRICE', 'Gain_Holding_Score_%', 'Delivery_%']].copy()
+    elif mtf_processed is not None:
+        merged = mtf_processed[['Symbol', 'MTF_Scenario', 'Delta_MTF']].copy()
+    else:
+        merged = fno_processed[['Symbol', 'FnO_Scenario', oi_col]].copy()
+
+    # Left Join Active Datasets
+    if pa_processed is not None and 'CLOSE_PRICE' not in merged.columns:
+        merged = pd.merge(merged, pa_processed[['Symbol', 'CLOSE_PRICE', 'Gain_Holding_Score_%', 'Delivery_%']], on='Symbol', how='left')
+    
+    if mtf_processed is not None and 'MTF_Scenario' not in merged.columns:
+        merged = pd.merge(merged, mtf_processed[['Symbol', 'MTF_Scenario', 'Delta_MTF']], on='Symbol', how='left')
+        
+    if fno_processed is not None and 'FnO_Scenario' not in merged.columns:
+        merged = pd.merge(merged, fno_processed[['Symbol', 'FnO_Scenario', oi_col]], on='Symbol', how='left')
+
+    # Fill Missing columns with neutrals so logic won't fail
+    for col in ['CLOSE_PRICE', 'Gain_Holding_Score_%', 'Delivery_%', 'Delta_MTF']:
+        if col not in merged.columns: merged[col] = 0.0
+    for col in ['MTF_Scenario', 'FnO_Scenario']:
+        if col not in merged.columns: merged[col] = 'Data Missing'
+
     merged['Sector'] = merged['Symbol'].apply(get_sector)
     
+    # Calculate RVOL
     rvol_df = calculate_rvol(merged['Symbol'].tolist())
     if not rvol_df.empty:
         merged = pd.merge(merged, rvol_df, on='Symbol', how='left').fillna(1.0)
     else:
         merged['RVOL'] = 1.0
 
-    is_bullish = (merged['MTF_Scenario'] == 'Bullish Leverage Acceleration') & (merged['FnO_Scenario'] == 'Long Buildup') & (merged['Gain_Holding_Score_%'] >= 80)
-    is_bearish = (merged['FnO_Scenario'] == 'Short Buildup') & ((merged['Gain_Holding_Score_%'] <= 20) | (merged['MTF_Scenario'] == 'Catching a Falling Knife (Danger)'))
+    # Dynamic Scoring Engine
+    has_pa = pa_processed is not None
+    has_mtf = mtf_processed is not None
+    has_fno = fno_processed is not None
+
+    def eval_signal(row):
+        active_bull = 0
+        active_bear = 0
+        total_active = sum([has_pa, has_mtf, has_fno])
+
+        # Evaluate what we have
+        if has_pa:
+            if row['Gain_Holding_Score_%'] >= 80: active_bull += 1
+            elif row['Gain_Holding_Score_%'] <= 20: active_bear += 1
+        
+        if has_mtf:
+            if row['MTF_Scenario'] == 'Bullish Leverage Acceleration': active_bull += 1
+            elif row['MTF_Scenario'] == 'Catching a Falling Knife (Danger)': active_bear += 1
+            
+        if has_fno:
+            if row['FnO_Scenario'] == 'Long Buildup': active_bull += 1
+            elif row['FnO_Scenario'] == 'Short Buildup': active_bear += 1
+
+        # Full Engine Processing
+        if has_pa and has_mtf and has_fno:
+            bull = (row['MTF_Scenario'] == 'Bullish Leverage Acceleration') and (row['FnO_Scenario'] == 'Long Buildup') and (row['Gain_Holding_Score_%'] >= 80)
+            bear = (row['FnO_Scenario'] == 'Short Buildup') and ((row['Gain_Holding_Score_%'] <= 20) or (row['MTF_Scenario'] == 'Catching a Falling Knife (Danger)'))
+            
+            if bull and row['Delivery_%'] >= 50.0 and row['RVOL'] >= 1.5: return '🌟 SUPREME BULL (Inst. Buy + Volume Spike)'
+            elif bull and row['Delivery_%'] >= 50.0: return '🏛️ INSTITUTIONAL BULL (>50% Delivery)'
+            elif bull and row['Delivery_%'] < 50.0: return '🎲 SPECULATIVE BULL (<50% Delivery)'
+            elif bear: return '🚨 BEARISH CONVICTION (HIGH RISK)'
+            return 'Neutral / Mixed'
+            
+        # Partial Engine Processing
+        else:
+            if active_bull == total_active and total_active > 0:
+                if has_pa and row['Delivery_%'] >= 50.0: return '🏛️ Partial Conviction Bull (Inst. Delivery)'
+                return '⚠️ Partial Conviction Bull (Incomplete Data)'
+            elif active_bear == total_active and total_active > 0:
+                return '🚨 Partial Bearish Conviction'
+            elif active_bull > 0:
+                return '🎲 Speculative Bull (Partial Data)'
+            return 'Neutral / Missing Data'
+
+    merged['Master_Signal'] = merged.apply(eval_signal, axis=1)
     
-    conditions = [
-        (is_bullish) & (merged['Delivery_%'] >= 50.0) & (merged['RVOL'] >= 1.5),
-        (is_bullish) & (merged['Delivery_%'] >= 50.0),
-        (is_bullish) & (merged['Delivery_%'] < 50.0),
-        (is_bearish)
-    ]
-    choices = ['🌟 SUPREME BULL (Inst. Buy + Volume Spike)', '🏛️ INSTITUTIONAL BULL (>50% Delivery)', '🎲 SPECULATIVE BULL (<50% Delivery)', '🚨 BEARISH CONVICTION (HIGH RISK)']
-    merged['Master_Signal'] = np.select(conditions, choices, default='Neutral / Mixed')
-    
-    return merged, None
+    return merged, None, active_sources, missing_sources
 
 # ==========================================
 # USER INTERFACE
@@ -241,12 +348,12 @@ if input_mode == "Auto-Fetch from NSE":
             fno_raw, f_err = fetch_nse_data(selected_date, "FNO")
             pa_raw, p_err = fetch_nse_data(selected_date, "BHAVCOPY")
             
-            # Error checking
-            if m_err or f_err or p_err:
-                if m_err: st.sidebar.error(m_err)
-                if f_err: st.sidebar.error(f_err)
-                if p_err: st.sidebar.error(p_err)
-            else:
+            # Print non-fatal errors but allow partial execution
+            if m_err: st.sidebar.error(m_err)
+            if f_err: st.sidebar.error(f_err)
+            if p_err: st.sidebar.error(p_err)
+            
+            if mtf_raw is not None or fno_raw is not None or pa_raw is not None:
                 data_ready = True
 
 elif input_mode == "Manual Upload Backup":
@@ -255,28 +362,42 @@ elif input_mode == "Manual Upload Backup":
     fno_file = st.sidebar.file_uploader("2. F&O Participant OI", type=["csv"])
     pa_file = st.sidebar.file_uploader("3. EOD Bhavcopy", type=["csv"])
     
-    if mtf_file and fno_file and pa_file:
-        mtf_raw = pd.read_csv(mtf_file)
-        fno_raw = pd.read_csv(fno_file)
-        pa_raw = pd.read_csv(pa_file)
+    if mtf_file or fno_file or pa_file:
+        mtf_raw = load_and_clean_csv(mtf_file)
+        fno_raw = load_and_clean_csv(fno_file)
+        pa_raw = load_and_clean_csv(pa_file)
         data_ready = True
 
 # PROCESS DATA IF READY
 if data_ready:
     try:
         with st.spinner("Crunching data, fetching RVOL from Yahoo Finance, and mapping sectors..."):
-            confluence_df, error = calculate_master_confluence(mtf_raw, fno_raw, pa_raw)
+            confluence_df, error, active_srcs, missing_srcs = calculate_master_confluence(mtf_raw, fno_raw, pa_raw)
         
         if error:
             st.error(error)
         else:
-            supreme = confluence_df[confluence_df['Master_Signal'] == '🌟 SUPREME BULL (Inst. Buy + Volume Spike)']
-            inst = confluence_df[confluence_df['Master_Signal'] == '🏛️ INSTITUTIONAL BULL (>50% Delivery)']
+            # RENDER DYNAMIC DISCLAIMER BANNER
+            if missing_srcs:
+                st.warning(
+                    f"⚠️ **PARTIAL DATA MODE ACTIVE**\n\n"
+                    f"* **Active Datasets:** {', '.join(active_srcs)}\n"
+                    f"* **Missing Datasets:** {', '.join(missing_srcs)}\n\n"
+                    f"*Note: Confluence conviction scores are dynamically calculated using available parameters. "
+                    f"Tiers requiring missing streams have been downgraded or marked partial.*"
+                )
+            else:
+                st.success("✅ **FULL CONFLUENCE MODE:** All 3 data streams active.")
+
+            # Metrics
+            supreme = confluence_df[confluence_df['Master_Signal'].str.contains('SUPREME BULL')]
+            inst = confluence_df[confluence_df['Master_Signal'].str.contains('INSTITUTIONAL BULL|Partial Conviction Bull')]
+            bears = confluence_df[confluence_df['Master_Signal'].str.contains('BEARISH CONVICTION|Partial Bearish')]
             
             c1, c2, c3 = st.columns(3)
             c1.metric("🌟 Supreme Conviction Trades", len(supreme))
-            c2.metric("🏛️ Standard Institutional Buys", len(inst))
-            c3.metric("🚨 High Risk Shorts", len(confluence_df[confluence_df['Master_Signal'] == '🚨 BEARISH CONVICTION (HIGH RISK)']))
+            c2.metric("🏛️ Institutional Buys", len(inst))
+            c3.metric("🚨 High Risk Shorts", len(bears))
             
             st.divider()
             t1, t2, t3, t4 = st.tabs(["🎯 Top Signals", "📊 Visual Screener (Chart)", "🗺️ Sector Heatmap", "📋 Database"])
@@ -284,23 +405,30 @@ if data_ready:
             with t1:
                 st.subheader("High Conviction Breakouts")
                 display_cols = ['Symbol', 'Sector', 'CLOSE_PRICE', 'Delivery_%', 'Gain_Holding_Score_%', 'RVOL', 'Master_Signal']
+                
+                # Filter down to just what we need, ignoring columns that don't exist if data is missing
+                available_display_cols = [c for c in display_cols if c in confluence_df.columns]
                 combined_bulls = pd.concat([supreme, inst]).sort_values(by=['RVOL', 'Delivery_%'], ascending=[False, False])
-                st.dataframe(combined_bulls[display_cols], use_container_width=True)
+                st.dataframe(combined_bulls[available_display_cols], use_container_width=True)
                 
             with t2:
                 st.subheader("Institutional Quadrant Analysis")
                 st.markdown("Look for dots in the **Top-Right** (High Delivery + Held Intraday Gains). Size of dot = RVOL.")
                 
                 fig = px.scatter(
-                    confluence_df[confluence_df['Master_Signal'] != 'Neutral / Mixed'],
+                    confluence_df[~confluence_df['Master_Signal'].str.contains('Neutral')],
                     x="Delivery_%", y="Gain_Holding_Score_%",
                     color="Master_Signal", size="RVOL", hover_name="Symbol",
                     hover_data=["Sector", "CLOSE_PRICE"],
                     color_discrete_map={
                         '🌟 SUPREME BULL (Inst. Buy + Volume Spike)': '#00FF00',
                         '🏛️ INSTITUTIONAL BULL (>50% Delivery)': '#008000',
+                        '🏛️ Partial Conviction Bull (Inst. Delivery)': '#7CFC00',
+                        '⚠️ Partial Conviction Bull (Incomplete Data)': '#9ACD32',
                         '🎲 SPECULATIVE BULL (<50% Delivery)': '#FFA500',
-                        '🚨 BEARISH CONVICTION (HIGH RISK)': '#FF0000'
+                        '🎲 Speculative Bull (Partial Data)': '#FFD700',
+                        '🚨 BEARISH CONVICTION (HIGH RISK)': '#FF0000',
+                        '🚨 Partial Bearish Conviction': '#CD5C5C'
                     },
                     template="plotly_dark", height=600
                 )
@@ -310,7 +438,7 @@ if data_ready:
 
             with t3:
                 st.subheader("Sectoral Heatmap (Where is the money flowing?)")
-                bulls_only = confluence_df[confluence_df['Master_Signal'].str.contains('BULL')]
+                bulls_only = confluence_df[confluence_df['Master_Signal'].str.contains('Bull|BULL', case=False)]
                 if not bulls_only.empty:
                     sector_flow = bulls_only.groupby('Sector').size().reset_index(name='Bullish_Signals').sort_values(by='Bullish_Signals', ascending=False)
                     st.bar_chart(sector_flow.set_index('Sector'))
@@ -324,6 +452,6 @@ if data_ready:
     except Exception as e:
         st.error(f"Execution Error: {e}")
 elif not data_ready and input_mode == "Manual Upload Backup":
-    st.info("Upload MTF, F&O, and Bhavcopy CSVs to initiate the Quant Engine.")
+    st.info("Upload at least ONE dataset (MTF, F&O, or Bhavcopy) to initiate the Quant Engine.")
 else:
     st.info("Select a date and click 'Fetch & Analyze' to run the engine.")
