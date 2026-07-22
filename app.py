@@ -5,6 +5,7 @@ import requests
 from datetime import datetime, date
 import calendar
 import io
+import zipfile
 import yfinance as yf
 import plotly.express as px
 
@@ -94,7 +95,11 @@ def fetch_nse_data(selected_date, report_type="MTF"):
     if report_type == "MTF":
         target_url = f"https://nsearchives.nseindia.com/archives/equities/mtf/MTF_Disclosure_{date_str}.csv"
     elif report_type == "FNO":
-        target_url = f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{date_str}.csv"
+        # The correct NSE FO Bhavcopy URL format (requires unzipping)
+        month_str = selected_date.strftime("%b").upper()
+        year = selected_date.strftime("%Y")
+        day = selected_date.strftime("%d")
+        target_url = f"https://nsearchives.nseindia.com/content/historical/DERIVATIVES/{year}/{month_str}/fo{day}{month_str}{year}bhav.csv.zip"
     else: # BHAVCOPY
         target_url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
         
@@ -103,7 +108,15 @@ def fetch_nse_data(selected_date, report_type="MTF"):
         response = session.get(target_url, headers=headers, timeout=15)
         
         if response.status_code == 200:
-            return load_and_clean_csv(response.content), None
+            if report_type == "FNO":
+                # F&O data is zipped. Extract the CSV directly in memory.
+                with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                    csv_filename = [name for name in z.namelist() if name.endswith('.csv')][0]
+                    with z.open(csv_filename) as f:
+                        return load_and_clean_csv(f.read()), None
+            else:
+                return load_and_clean_csv(response.content), None
+                
         elif response.status_code == 404:
             return None, f"404: {report_type} report not uploaded by NSE yet."
         elif response.status_code == 403:
@@ -193,15 +206,29 @@ def process_fno_data(df):
     
     # Fail-safe if symbol column cannot be found
     if 'Symbol' not in df_analyzed.columns:
-        # Grab the first 5 columns to show the user what was actually in the file
         found_cols = ", ".join(df.columns.tolist()[:5])
         return None, f"Could not locate Symbol column. The file contains: {found_cols}..."
         
+    # Filter ONLY Stock Futures (FUTSTK) to remove options noise
+    if 'INSTRUMENT' in df_analyzed.columns:
+        df_analyzed = df_analyzed[df_analyzed['INSTRUMENT'] == 'FUTSTK']
+
+    # Standardize OI & Price Columns from raw NSE FO Bhavcopy
+    if 'CHG_IN_OI' in df_analyzed.columns:
+        df_analyzed['Delta_OI'] = df_analyzed['CHG_IN_OI']
+        
+    if 'CLOSE' in df_analyzed.columns and 'OPEN' in df_analyzed.columns:
+        df_analyzed['Price_Change_Pct'] = df_analyzed['CLOSE'] - df_analyzed['OPEN']
+
+    # Keep existing fallbacks for third-party processed CSVs
     price_col = 'Price_Change_Pct' if 'Price_Change_Pct' in df_analyzed.columns else 'chng_in_price'
     oi_col = 'Delta_OI' if 'Delta_OI' in df_analyzed.columns else 'chng_in_OI'
     
     if price_col not in df_analyzed.columns: df_analyzed[price_col] = 0.0
     if oi_col not in df_analyzed.columns: df_analyzed[oi_col] = 0.0
+
+    # Aggregate OI changes across all expiry months for each stock
+    df_analyzed = df_analyzed.groupby('Symbol', as_index=False).sum(numeric_only=True)
 
     conditions = [
         (df_analyzed[price_col] > 0) & (df_analyzed[oi_col] > 0),
