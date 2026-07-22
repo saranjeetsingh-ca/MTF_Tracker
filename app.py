@@ -193,7 +193,9 @@ def process_fno_data(df):
     
     # Fail-safe if symbol column cannot be found
     if 'Symbol' not in df_analyzed.columns:
-        return None, None
+        # Grab the first 5 columns to show the user what was actually in the file
+        found_cols = ", ".join(df.columns.tolist()[:5])
+        return None, f"Could not locate Symbol column. The file contains: {found_cols}..."
         
     price_col = 'Price_Change_Pct' if 'Price_Change_Pct' in df_analyzed.columns else 'chng_in_price'
     oi_col = 'Delta_OI' if 'Delta_OI' in df_analyzed.columns else 'chng_in_OI'
@@ -264,11 +266,12 @@ def calculate_master_confluence(mtf_df, fno_df, pa_df):
         missing_sources.append("MTF Retail Leverage")
 
     if fno_df is not None:
-        fno_processed, oi_col = process_fno_data(fno_df)
+        fno_processed, fno_err = process_fno_data(fno_df)
         if fno_processed is not None:
             active_sources.append("F&O Smart Money OI")
+            oi_col = fno_err # When successful, the second return value is the oi_col name
         else:
-            missing_sources.append("F&O Error: Could not locate Symbol column")
+            missing_sources.append(f"F&O Error: {fno_err}")
     else:
         missing_sources.append("F&O Smart Money OI")
 
