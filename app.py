@@ -145,15 +145,30 @@ def calculate_rvol(symbols):
 # CORE ENGINES
 # ==========================================
 def standardize_symbol(df):
+    """
+    Expands the search vocabulary to catch NSE's inconsistent column naming.
+    """
+    valid_names = [
+        'symbol', 'stock_symbol', 'scrip_name', 'symbol_name', 
+        'scrip', 'name of scrip', 'underlying', 'ticker'
+    ]
+    
     for col in df.columns:
-        if col.strip().lower() in ['symbol', 'stock_symbol', 'scrip_name', 'symbol_name']:
+        if col.strip().lower() in valid_names:
             df = df.rename(columns={col: 'Symbol'})
             break
-    if 'Symbol' in df.columns: df['Symbol'] = df['Symbol'].astype(str).str.strip().str.upper()
+            
+    if 'Symbol' in df.columns: 
+        df['Symbol'] = df['Symbol'].astype(str).str.strip().str.upper()
     return df
 
 def process_mtf_data(df):
     df_analyzed = standardize_symbol(df.copy())
+    
+    # Fail-safe if symbol column cannot be found
+    if 'Symbol' not in df_analyzed.columns:
+        return None
+        
     if 'Current_Day_Funded_Value' in df_analyzed.columns and 'Previous_Day_Funded_Value' in df_analyzed.columns:
         df_analyzed['Delta_MTF'] = df_analyzed['Current_Day_Funded_Value'] - df_analyzed['Previous_Day_Funded_Value']
     else:
@@ -170,10 +185,16 @@ def process_mtf_data(df):
         df_analyzed['MTF_Scenario'] = np.select(conditions, choices, default='Neutral')
     else:
         df_analyzed['MTF_Scenario'] = 'No Price Data'
+        
     return df_analyzed
 
 def process_fno_data(df):
     df_analyzed = standardize_symbol(df.copy())
+    
+    # Fail-safe if symbol column cannot be found
+    if 'Symbol' not in df_analyzed.columns:
+        return None, None
+        
     price_col = 'Price_Change_Pct' if 'Price_Change_Pct' in df_analyzed.columns else 'chng_in_price'
     oi_col = 'Delta_OI' if 'Delta_OI' in df_analyzed.columns else 'chng_in_OI'
     
@@ -188,10 +209,16 @@ def process_fno_data(df):
     ]
     choices = ['Long Buildup', 'Short Covering', 'Short Buildup', 'Long Unwinding']
     df_analyzed['FnO_Scenario'] = np.select(conditions, choices, default='Neutral')
+    
     return df_analyzed, oi_col
 
 def process_price_action(df):
     df_pa = standardize_symbol(df.copy())
+    
+    # Fail-safe if symbol column cannot be found
+    if 'Symbol' not in df_pa.columns:
+        return None, "Could not locate a recognizable Symbol/Ticker column in the Bhavcopy."
+        
     req_cols = ['OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE']
     for col in req_cols:
         if col not in df_pa.columns: return df_pa, f"Missing {col}"
@@ -207,6 +234,7 @@ def process_price_action(df):
     
     candle_range = np.where((H - L) == 0, 0.0001, H - L)
     df_pa['Gain_Holding_Score_%'] = (((C - L) / candle_range) * 100).round(2)
+    
     return df_pa, None
 
 def calculate_master_confluence(mtf_df, fno_df, pa_df):
@@ -216,23 +244,31 @@ def calculate_master_confluence(mtf_df, fno_df, pa_df):
     pa_processed, mtf_processed, fno_processed = None, None, None
     pa_err = None
 
-    # Track available vs missing datasets
+    # Track available vs missing datasets and gracefully skip unreadable ones
     if pa_df is not None:
         pa_processed, pa_err = process_price_action(pa_df)
-        if not pa_err: active_sources.append("Price Action & Delivery (Bhavcopy)")
-        else: missing_sources.append(f"Bhavcopy Error: {pa_err}")
+        if pa_processed is not None and not pa_err: 
+            active_sources.append("Price Action & Delivery (Bhavcopy)")
+        else: 
+            missing_sources.append(f"Bhavcopy Error: {pa_err}")
     else:
         missing_sources.append("Price Action & Delivery (Bhavcopy)")
 
     if mtf_df is not None:
         mtf_processed = process_mtf_data(mtf_df)
-        active_sources.append("MTF Retail Leverage")
+        if mtf_processed is not None:
+            active_sources.append("MTF Retail Leverage")
+        else:
+            missing_sources.append("MTF Error: Could not locate Symbol column")
     else:
         missing_sources.append("MTF Retail Leverage")
 
     if fno_df is not None:
         fno_processed, oi_col = process_fno_data(fno_df)
-        active_sources.append("F&O Smart Money OI")
+        if fno_processed is not None:
+            active_sources.append("F&O Smart Money OI")
+        else:
+            missing_sources.append("F&O Error: Could not locate Symbol column")
     else:
         missing_sources.append("F&O Smart Money OI")
 
@@ -382,7 +418,7 @@ if data_ready:
                 st.warning(
                     f"⚠️ **PARTIAL DATA MODE ACTIVE**\n\n"
                     f"* **Active Datasets:** {', '.join(active_srcs)}\n"
-                    f"* **Missing Datasets:** {', '.join(missing_srcs)}\n\n"
+                    f"* **Missing/Skipped Datasets:** {', '.join(missing_srcs)}\n\n"
                     f"*Note: Confluence conviction scores are dynamically calculated using available parameters. "
                     f"Tiers requiring missing streams have been downgraded or marked partial.*"
                 )
